@@ -1,201 +1,85 @@
-# FREELANCER CRM  
-A simple and efficient CRM for freelancers to manage clients, projects, and tasks — built with **Django** and **Django REST Framework (DRF)** as the backend and **React/Vite** as the frontend
+<div align="center">
+
+# 💼 Freelancer CRM · API
+
+### Know who owes you what, in any currency.
+
+**Django REST API for freelancers to track clients, projects and payments, with each user's data fully walled off from everyone else's.**
+
+[![Live Demo](https://img.shields.io/badge/🔴_Live_Demo-Freelancer_CRM-7c3aed?style=for-the-badge)](https://jessywaweru.github.io/freelancer-crm-ui/)
+[![Frontend](https://img.shields.io/badge/Frontend_Repo-freelancer--crm--ui-0f172a?style=for-the-badge&logo=github)](https://github.com/JessyWaweru/freelancer-crm-ui)
+
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![Django](https://img.shields.io/badge/Django_5.2-092E20?logo=django&logoColor=white)
+![DRF](https://img.shields.io/badge/DRF-A30000?logo=django&logoColor=white)
+![JWT](https://img.shields.io/badge/SimpleJWT-000000?logo=jsonwebtokens&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql&logoColor=white)
+![pytest](https://img.shields.io/badge/pytest-0A9EDC?logo=pytest&logoColor=white)
+
+<sub>⏳ API on Render's free tier: the first request may take ~45s to wake up. Invoices wait for no one, but this one needs a minute. ☕</sub>
+
+</div>
 
 ---
 
-## 🚀 Features
-- 👤 **User Registration & Authentication** (JWT authentication)
-- 🧾 **Client Management** (create, list, update,delete)
-- 📁 **Project Management** (create, assign to client, update, delete)
-- 🔐 **Secure API endpoints**
-- ⚙️ **RESTful design using DRF ViewSets + Routers**
+## 🔒 Your clients are *your* clients
 
----
+Multi-tenant data isolation is enforced at **three** layers, not just in the UI:
 
-## 🛠️ Tech Stack
-- **Python 3**
-- **Django**
-- **Django REST Framework (DRF)**
-- **SimpleJWT** for authentication
-- **PostgreSQL** 
-- **React/Vite**
+| Layer | How |
+|---|---|
+| **Querysets** | `Client` and `Project` queries are always filtered by `owner` / `client__owner`, so other users' rows are never even fetched |
+| **Object permission** | A custom `IsOwner` permission guards every client detail route |
+| **Write validation** | A project can only be attached to a client **you** own. Point it at someone else's client ID and the API rejects it |
 
----
+Every one of these is covered by tests.
 
-## 📂 Project Structure
-```
-FREELANCER_CRM/
-│── gitignore
-│── .env
-│── manage.py
-│── Procfile
-│── requirements.txt
-│── crm/
-│   ├── models.py
-│   ├── views.py
-│   ├── serializers.py
-│   ├── urls.py
-│   ├── register.py
-│   ├── tests/
-│── crm_project/
-│   ├── settings.py
-│   ├── urls.py
-│   ├── wsgi.py
-│── freelancer-crm-ui/
+## 💸 What it tracks
 
-```
+- 👥 **Clients**: name, email, phone, company
+- 📁 **Projects**: status (active / completed / on-hold), start & due dates, linked to a client
+- 💱 **Payments in USD, KES, EUR or GBP**, with status `paid` / `unpaid` / `partial`
+- 🔎 Filter projects per client with `?client=<id>`
 
----
+## 📡 API
 
-## 🔑 API Authentication (JWT)
-The API uses **JSON Web Tokens** with SimpleJWT.
+| Method | Endpoint | What it does | Access |
+|:---:|---|---|:---:|
+| `POST` | `/api/register/` | Create an account | 🌍 |
+| `POST` | `/api/auth/token/` · `/api/auth/refresh/` | JWT login / refresh | 🌍 |
+| `GET` `POST` `PATCH` `DELETE` | `/api/clients/…` | Your clients | 🔐 |
+| `GET` `POST` `PATCH` `DELETE` | `/api/projects/…?client=<id>` | Your projects | 🔐 |
+| `GET` | `/api/health/` | Uptime ping | 🌍 |
 
-### Obtain Token  
-POST → `/api/auth/token/`
+## 🚀 Run it locally
 
-Body:
-```json
-{
-  "username": "yourusername",
-  "password": "yourpassword"
-}
-```
-
-### Refresh Token  
-POST → `/api/auth/refresh/`
-
----
-
-## 👤 User Registration
-Endpoint for new user signup:
-
-POST → `/api/register/`
-
-Body:
-```json
-{
-  "username": "newuser",
-  "password": "password123"
-}
-```
-
----
-
-## 👥 Clients API
-
-### List Clients  
-GET → `/api/clients/`
-
-### Create Client  
-POST → `/api/clients/`
-
-Example Body:
-```json
-{
-  "name": "John Doe",
-  "phone": "0712345678",
-  "company": "Nairobi"
-}
-```
-
----
-
-## 📁 Projects API
-
-### List Projects  
-GET → `/api/projects/`
-
-### Create Project  
-POST → `/api/projects/`
-
-Example Body:
-```json
-{
-  "title": "Website Design",
-  "status": "Active",
-  "client": 1
-}
-```
-
----
-
-## 🧭 URLs Overview
-
-### **Main URLs (`FREELANCER_CRM/urls.py`)**
-```
-
-/api/
-/api/auth/token/
-/api/auth/refresh/
-```
-
-### **CRM App URLs (`crm/urls.py`)**
-```
-/clients/
-/projects/
-/register/
-```
-
-All automatically routed using `DefaultRouter`.
-
----
-
-## ▶️ Running the Project Locally
-
-### START VIRTUAL ENVIRONMENT(IF PY IS INSTALLED IN A VIRTUAL ENV) ON UBUNTU/(OTHER):
-`source myenv/bin/activate`
-
-### START POSTGRES SERVER ON UBUNTU:
-`sudo service postgresql start`
-
-### 1️⃣ Install dependencies  
-```
+```bash
+git clone https://github.com/JessyWaweru/freelancer-crm-api.git
+cd freelancer-crm-api
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2️⃣ Run migrations  
-```
+echo "DEBUG=True" > .env
 python manage.py migrate
-```
-### (Optional) Run tests for Backend
-```
-pytest
+python manage.py runserver        # → http://127.0.0.1:8000/api/
 ```
 
-### 3️⃣ Start server  
-```
-python manage.py runserver
-```
+Production: `SECRET_KEY`, `DATABASE_URL` (Postgres via `dj-database-url`), `DEBUG=False`. Render starts it with the [`Procfile`](Procfile) (Gunicorn).
 
-### 4️⃣ cd into the Frontend
-```
-cd freelnacer-crm-ui
-```
+## 🧪 Tests
 
-### 5️⃣ Install Dependencies
+```bash
+pip install pytest pytest-django pytest-cov
+pytest            # auth, clients, projects and cross-user isolation, with coverage
 ```
-npm i
-```
-
-### 6️⃣ Run the Dev Server
-```
-npm run dev
-```
-
-### 7️⃣ Open in Browser
-Go to the URL shown in the terminal (usually http://localhost:5173) to see the app live.
 
 ---
 
-## 🤝 Contributing
-Contributions are welcome!  
-Feel free to open issues or submit pull requests.
+<div align="center">
 
----
+**Built by Jessy Bryan Waweru**: actuary by training, full-stack engineer by obsession.
 
-## 📜 License
-This project is licensed under the **MIT License**.
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/jessy-waweru-b8051a288)
+[![Email](https://img.shields.io/badge/Email-EA4335?logo=gmail&logoColor=white)](mailto:bryanjessywaweru@gmail.com)
+[![GitHub](https://img.shields.io/badge/More_projects-181717?logo=github)](https://github.com/JessyWaweru)
 
-
-
--
+</div>

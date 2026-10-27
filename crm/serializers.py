@@ -30,6 +30,12 @@ class ProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Project
         fields = "__all__"
+
+    def validate_client(self, client):
+        # A project can only be attached to one of the logged-in user's own clients.
+        if client.owner_id != self.context["request"].user.id:
+            raise serializers.ValidationError("Client not found.")
+        return client
         # fields = "__all__" ensures all Project fields are included
         # plus the extra client_name + client_id we defined above.
 

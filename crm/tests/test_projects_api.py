@@ -83,3 +83,22 @@ def test_delete_project():
 
     assert response.status_code == 204
     assert Project.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_cannot_attach_project_to_another_users_client():
+    owner = User.objects.create_user(username="owner", password="pass1234")
+    intruder = User.objects.create_user(username="intruder", password="pass1234")
+    their_client = Client.objects.create(name="Not Yours", owner=owner)
+    my_client = Client.objects.create(name="Mine", owner=intruder)
+    my_project = Project.objects.create(title="Mine", status="ongoing", client=my_client)
+
+    client = APIClient()
+    client.force_authenticate(user=intruder)
+
+    response = client.post(reverse("project-list"), {"title": "Sneaky", "status": "ongoing", "client": their_client.id}, format="json")
+    assert response.status_code == 400
+
+    response = client.patch(reverse("project-detail", args=[my_project.id]), {"client": their_client.id}, format="json")
+    assert response.status_code == 400
+    assert not Project.objects.filter(client=their_client).exists()
