@@ -183,3 +183,32 @@ def test_deleting_monthly_invoice_frees_the_month(api, client_obj):
     assert api.get(f"/api/projects/{data['id']}/").data["next_invoice_date"] != today.isoformat()
     assert api.delete(f"/api/invoices/{inv['id']}/").status_code == 204
     assert api.get(f"/api/projects/{data['id']}/").data["next_invoice_date"] == today.isoformat()
+
+
+@pytest.mark.django_db
+def test_earnings_count_each_payment_once(api, client_obj, user):
+    today = timezone.localdate()
+    # 1. A retainer month paid via its invoice (counted once, through the invoice).
+    data = make_retainer(api, client_obj, today)
+    inv = api.post(f"/api/projects/{data['id']}/generate_invoice/", {"kind": "monthly"}, format="json").data
+    api.post(f"/api/invoices/{inv['id']}/mark_sent/")
+    api.post(f"/api/invoices/{inv['id']}/mark_paid/")
+    # 2. A retainer month marked paid with no invoice (M-Pesa).
+    data2 = make_retainer(api, client_obj, today, amount="2000")
+    api.post(f"/api/projects/{data2['id']}/retainer/", {"period": today.isoformat()}, format="json")
+    # 3. A fixed fee marked paid on the project, never invoiced.
+    Project.objects.create(title="Logo", client=client_obj, billing_type="fixed", payment_amount=Decimal("3000"),
+                           payment_status="paid", payment_currency="KES", due_date=today)
+    # 4. Unpaid things don't count.
+    Project.objects.create(title="Later", client=client_obj, billing_type="fixed", payment_amount=Decimal("9999"),
+                           payment_currency="KES")
+
+    d = api.get("/api/dashboard/").data
+    e = d["earnings"][0]
+    assert e["currency"] == "KES"
+    assert Decimal(str(e["all_time"])) == Decimal("11000")
+    assert Decimal(str(e["this_month"])) == Decimal("11000")
+    assert e["payments"] == 3
+    assert len(e["by_month"]) == 12 and Decimal(str(e["by_month"][-1]["amount"])) == Decimal("11000")
+    assert e["by_client"][0]["name"] == "GoHerbal"
+    assert Decimal(str(d["totals"][0]["paid_this_month"])) == Decimal("11000")

@@ -423,6 +423,71 @@ def build_reminders(user):
     return reminders
 
 
+def earnings_ledger(user):
+    """Every payment received, as (date, currency, amount, client_id, client_name).
+
+    Counted once each: paid invoices; retainer months marked paid without a paid invoice;
+    fixed fees marked paid on the project without a paid invoice for them.
+    """
+    rows = []
+    paid_fee_projects = set()
+    paid_invoices = Invoice.objects.filter(owner=user, status="paid").select_related("client").prefetch_related("items")
+    for inv in paid_invoices:
+        when = timezone.localdate(inv.paid_at) if inv.paid_at else inv.issue_date
+        rows.append((when, inv.currency, inv.total, inv.client_id, inv.client.name))
+        if inv.kind != "monthly" and inv.project_id:
+            paid_fee_projects.add(inv.project_id)
+
+    payments = RetainerPayment.objects.filter(project__client__owner=user).select_related("project__client", "invoice")
+    for rp in payments:
+        if rp.invoice and rp.invoice.status == "paid":
+            continue  # already counted with its invoice
+        c = rp.project.client
+        rows.append((rp.paid_on, rp.project.payment_currency, rp.amount, c.id, c.name))
+
+    fees = (
+        Project.objects.select_related("client")
+        .filter(client__owner=user, payment_status="paid", billing_type__in=["fixed", "both"], payment_amount__gt=0)
+        .exclude(id__in=paid_fee_projects)
+    )
+    for p in fees:
+        # No payment date is stored for these; the deadline (or start) is the best guess.
+        rows.append((p.due_date or p.start_date, p.payment_currency, p.payment_amount, p.client_id, p.client.name))
+    return rows
+
+
+def earnings_summary(user, months=12):
+    """All-time, this year and this month earnings per currency, plus the last `months` months and top clients."""
+    today = timezone.localdate()
+    month_keys = [add_months(today.replace(day=1), -i) for i in range(months - 1, -1, -1)]
+    out = {}
+    for when, currency, amount, client_id, client_name in earnings_ledger(user):
+        e = out.setdefault(currency, {
+            "currency": currency,
+            "all_time": Decimal("0.00"),
+            "this_year": Decimal("0.00"),
+            "this_month": Decimal("0.00"),
+            "payments": 0,
+            "by_month": {m: Decimal("0.00") for m in month_keys},
+            "by_client": {},
+        })
+        e["all_time"] += amount
+        e["payments"] += 1
+        if when.year == today.year:
+            e["this_year"] += amount
+            if when.month == today.month:
+                e["this_month"] += amount
+        key = when.replace(day=1)
+        if key in e["by_month"]:
+            e["by_month"][key] += amount
+        cl = e["by_client"].setdefault(client_id, {"client": client_id, "name": client_name, "amount": Decimal("0.00")})
+        cl["amount"] += amount
+    for e in out.values():
+        e["by_month"] = [{"month": m, "amount": a} for m, a in e["by_month"].items()]
+        e["by_client"] = sorted(e["by_client"].values(), key=lambda c: c["amount"], reverse=True)[:5]
+    return list(out.values())
+
+
 def dashboard_totals(user):
     """Money totals per currency (never mixed across currencies)."""
     today = timezone.localdate()
@@ -451,7 +516,16 @@ def dashboard_totals(user):
     for p in Project.objects.filter(client__owner=user, status="active", billing_type__in=["monthly", "both"]):
         mrr[p.payment_currency] = mrr.get(p.payment_currency, Decimal("0.00")) + p.monthly_amount
 
+    earnings = earnings_summary(user)
+    # "Paid this month" counts every payment, not only invoices.
+    for e in earnings:
+        totals.setdefault(e["currency"], {
+            "currency": e["currency"], "outstanding": Decimal("0.00"), "overdue": Decimal("0.00"),
+            "paid_this_month": Decimal("0.00"), "draft": Decimal("0.00"),
+        })["paid_this_month"] = e["this_month"]
+
     return {
+        "earnings": earnings,
         "totals": list(totals.values()),
         "mrr": [{"currency": c, "amount": a} for c, a in mrr.items() if a > 0],
     }
