@@ -43,7 +43,7 @@ else:
 
 # SECURITY
 SECRET_KEY = env("SECRET_KEY", default="django-insecure-secret-key")
-ALLOWED_HOSTS = ["freelancer-crm-ipx8.onrender.com", "127.0.0.1"]
+ALLOWED_HOSTS = ["freelancer-crm-ipx8.onrender.com", "127.0.0.1", "localhost"]
 CSRF_TRUSTED_ORIGINS = ["https://freelancer-crm-ipx8.onrender.com"]
 
 # Application definition
@@ -74,6 +74,9 @@ MIDDLEWARE = [
 CORS_ALLOWED_ORIGINS = [
     "https://jessywaweru.github.io",  # GitHub Pages frontend
 ]
+if DEBUG:
+    # Local Vite dev server
+    CORS_ALLOWED_ORIGINS += ["http://localhost:5173", "http://127.0.0.1:5173"]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     "authorization",
