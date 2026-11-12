@@ -73,7 +73,10 @@ MIDDLEWARE = [
 # CORS configuration
 CORS_ALLOWED_ORIGINS = [
     "https://jessywaweru.github.io",  # GitHub Pages frontend
+    "https://freelancer-crm-ui.onrender.com",  # Render static site
 ]
+# Extra frontend origins without a code change, comma-separated (e.g. a custom domain).
+CORS_ALLOWED_ORIGINS += env.list("EXTRA_CORS_ORIGINS", default=[])
 if DEBUG:
     # Local Vite dev server
     CORS_ALLOWED_ORIGINS += ["http://localhost:5173", "http://127.0.0.1:5173"]
