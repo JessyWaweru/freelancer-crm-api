@@ -2,7 +2,10 @@
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
-from .models import Client, Project, BusinessProfile, Invoice, InvoiceItem
+from .models import (
+    Client, Project, ProjectItem, ProjectNote, ProjectTodo, BusinessProfile, Invoice, InvoiceItem,
+)
+from . import billing
 from .billing import first_billing_date, next_invoice_number
 from django.contrib.auth import get_user_model
 
@@ -23,16 +26,38 @@ class ClientSerializer(serializers.ModelSerializer):
         # read_only_fields → Prevent clients from manually setting these when posting data.
 
 
+class ProjectItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectItem
+        fields = ("id", "description", "amount", "recurring")
+        read_only_fields = ("id",)
+        # Blank rows from the form are dropped when saving rather than rejected.
+        extra_kwargs = {"description": {"allow_blank": True}}
+
+
 class ProjectSerializer(serializers.ModelSerializer):
     # Extra fields beyond the model:
     #   client_name → human-readable name of the client
     #   client_id → the FK id for linking back to Client
     client_name = serializers.CharField(source="client.name", read_only=True)
     client_id = serializers.IntegerField(source="client.id", read_only=True)
+    # Price breakdown used for invoice lines, e.g. developer fees + hosting + domain.
+    items = ProjectItemSerializer(many=True, required=False)
+    # Retainer months that are due and not paid yet (dates), and what they add up to.
+    unpaid_periods = serializers.SerializerMethodField()
+    unpaid_retainer_total = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
         fields = "__all__"
+        # Worked out from the retainer schedule and what's been invoiced or paid.
+        read_only_fields = ("next_invoice_date",)
+
+    def get_unpaid_periods(self, obj):
+        return billing.unpaid_periods(obj)
+
+    def get_unpaid_retainer_total(self, obj):
+        return str(obj.monthly_amount * len(billing.unpaid_periods(obj)))
 
     def validate_client(self, client):
         # A project can only be attached to one of the logged-in user's own clients.
@@ -41,26 +66,95 @@ class ProjectSerializer(serializers.ModelSerializer):
         return client
 
     def validate_billing_day(self, value):
-        if not 1 <= value <= 28:
-            raise serializers.ValidationError("Pick a day between 1 and 28.")
+        if not 1 <= value <= 31:
+            raise serializers.ValidationError("Pick a day between 1 and 31.")
         return value
 
-    def _set_first_invoice_date(self, project):
-        # A new retainer gets its first invoice date from the billing day.
-        if project.is_recurring and project.next_invoice_date is None:
-            project.next_invoice_date = first_billing_date(project.billing_day, timezone.localdate())
+    def validate(self, attrs):
+        # The first payment date also fixes the day of the month every later payment falls on.
+        if attrs.get("retainer_start"):
+            attrs["billing_day"] = attrs["retainer_start"].day
+        return attrs
+
+    def _save_items(self, project, items):
+        if items is None:
+            return
+        project.items.all().delete()
+        def is_recurring(i):
+            return {"fixed": False, "monthly": True}.get(project.billing_type, bool(i.get("recurring")))
+        rows = [
+            ProjectItem(project=project, description=i["description"].strip(), amount=i.get("amount") or 0,
+                        recurring=is_recurring(i))
+            for i in items if i.get("description", "").strip()
+        ]
+        ProjectItem.objects.bulk_create(rows)
+        # When there's a breakdown, the totals are its sums.
+        fixed = [r.amount for r in rows if not r.recurring]
+        monthly = [r.amount for r in rows if r.recurring]
+        if fixed and project.has_fixed_fee:
+            project.payment_amount = sum(fixed)
+        if monthly and project.is_recurring:
+            project.monthly_amount = sum(monthly)
+        project.save(update_fields=["payment_amount", "monthly_amount"])
+
+    def _sync_retainer(self, project):
+        if project.is_recurring and project.retainer_start is None:
+            project.retainer_start = first_billing_date(project.billing_day, timezone.localdate())
+            project.save(update_fields=["retainer_start"])
+        billing.sync_next_invoice_date(project)
+        if not project.is_recurring and project.next_invoice_date is not None:
+            project.next_invoice_date = None
             project.save(update_fields=["next_invoice_date"])
         return project
 
+    @transaction.atomic
     def create(self, validated_data):
-        return self._set_first_invoice_date(super().create(validated_data))
+        items = validated_data.pop("items", None)
+        project = super().create(validated_data)
+        self._save_items(project, items)
+        return self._sync_retainer(project)
 
+    @transaction.atomic
     def update(self, instance, validated_data):
-        old_day = instance.billing_day
+        items = validated_data.pop("items", None)
+        old_status = instance.status
+        new_status = validated_data.get("status", old_status)
+        if new_status != old_status and instance.is_recurring:
+            # Completing a project stops new retainer months; reopening it resumes them.
+            if new_status == "completed" and instance.retainer_end is None:
+                validated_data.setdefault("retainer_end", timezone.localdate())
+            elif new_status == "active":
+                validated_data.setdefault("retainer_end", None)
         project = super().update(instance, validated_data)
-        if project.is_recurring and "next_invoice_date" not in validated_data and project.billing_day != old_day:
-            project.next_invoice_date = None  # recompute for the new billing day
-        return self._set_first_invoice_date(project)
+        self._save_items(project, items)
+        return self._sync_retainer(project)
+
+
+class ProjectNoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectNote
+        fields = ("id", "project", "body", "created_at", "updated_at")
+        read_only_fields = ("created_at", "updated_at")
+
+    def validate_project(self, project):
+        if project.client.owner_id != self.context["request"].user.id:
+            raise serializers.ValidationError("Project not found.")
+        return project
+
+
+class ProjectTodoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectTodo
+        fields = ("id", "project", "title", "done", "due_date", "done_at", "created_at")
+        read_only_fields = ("done_at", "created_at")
+
+    validate_project = ProjectNoteSerializer.validate_project
+
+    def save(self, **kwargs):
+        done = self.validated_data.get("done")
+        if done is not None and (self.instance is None or self.instance.done != done):
+            kwargs["done_at"] = timezone.now() if done else None
+        return super().save(**kwargs)
 
 
 class BusinessProfileSerializer(serializers.ModelSerializer):

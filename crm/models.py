@@ -71,6 +71,11 @@ class Project(models.Model):
     billing_day = models.PositiveSmallIntegerField(default=1)
     # The date the next monthly invoice should be sent. Moves forward a month each time one is generated.
     next_invoice_date = models.DateField(null=True, blank=True)
+    # First date a monthly payment is due. Every month after it (on billing_day) is another payment,
+    # which counts as unpaid from that date until it's marked paid.
+    retainer_start = models.DateField(null=True, blank=True)
+    # Last date a monthly payment can fall on. Set automatically when the project is completed.
+    retainer_end = models.DateField(null=True, blank=True)
 
     @property
     def is_recurring(self):
@@ -79,6 +84,59 @@ class Project(models.Model):
     @property
     def has_fixed_fee(self):
         return self.billing_type in ("fixed", "both")
+
+
+class ProjectItem(models.Model):
+    """One priced part of a project, e.g. "Developer fees 5000", "Hosting 4000", "Domain 1000".
+
+    recurring=False items add up to the fixed fee, recurring=True items to the monthly retainer.
+    Invoices generated from the project get one line per item.
+    """
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="items")
+    description = models.CharField(max_length=200)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    recurring = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["id"]
+
+
+class RetainerPayment(models.Model):
+    """A month of a retainer that has been paid. Months without one are unpaid."""
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="retainer_payments")
+    # The scheduled due date of the month being paid for.
+    period_start = models.DateField()
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    paid_on = models.DateField(default=timezone.localdate)
+    invoice = models.ForeignKey("Invoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+
+    class Meta:
+        ordering = ["period_start"]
+        constraints = [
+            models.UniqueConstraint(fields=["project", "period_start"], name="unique_retainer_payment_per_period"),
+        ]
+
+
+class ProjectNote(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="notes")
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+
+class ProjectTodo(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="todos")
+    title = models.CharField(max_length=300)
+    done = models.BooleanField(default=False)
+    due_date = models.DateField(null=True, blank=True)
+    done_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["done", models.F("due_date").asc(nulls_last=True), "id"]
 
 
 class BusinessProfile(models.Model):

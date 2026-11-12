@@ -147,7 +147,8 @@ def test_reminders_cover_monthly_fixed_draft_and_overdue(api, user, client_obj):
 
     r = api.get("/api/reminders/")
     types = [x["type"] for x in r.data]
-    assert sorted(types) == ["draft", "fixed_due", "monthly_due", "overdue"]
+    # The Website project's past deadline is a reminder too.
+    assert sorted(types) == ["deadline", "draft", "fixed_due", "monthly_due", "overdue"]
     assert r.data[0]["severity"] == "overdue"
 
 
@@ -159,10 +160,12 @@ def test_paying_fixed_invoice_clears_fixed_reminder(api, client_obj):
     )
     inv_id = api.post(f"/api/projects/{p.id}/generate_invoice/", {"kind": "fixed"}, format="json").data["id"]
     # Once invoiced, it becomes a draft reminder instead of a fixed_due one.
-    assert [x["type"] for x in api.get("/api/reminders/").data] == ["draft"]
+    def money_reminders():
+        return [x["type"] for x in api.get("/api/reminders/").data if x["type"] != "deadline"]
+    assert money_reminders() == ["draft"]
     api.post(f"/api/invoices/{inv_id}/mark_sent/")
     api.post(f"/api/invoices/{inv_id}/mark_paid/")
-    assert api.get("/api/reminders/").data == []
+    assert money_reminders() == []
     p.refresh_from_db()
     assert p.payment_status == "paid"
 

@@ -6,9 +6,12 @@ from rest_framework import viewsets, permissions, mixins, generics
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
-from .models import Client, Project, Invoice
+from datetime import date
+
+from .models import Client, Project, Invoice, ProjectNote, ProjectTodo
 from .serializers import (
     ClientSerializer, ProjectSerializer, InvoiceSerializer, BusinessProfileSerializer,
+    ProjectNoteSerializer, ProjectTodoSerializer,
 )
 from . import billing
 from django.contrib.auth import get_user_model
@@ -68,6 +71,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         qs = (
             Project.objects
             .select_related("client")  # select_related → avoid extra queries when accessing client
+            .prefetch_related("items", "retainer_payments")
             .filter(client__owner=self.request.user)
         )
 
@@ -91,6 +95,50 @@ class ProjectViewSet(viewsets.ModelViewSet):
             InvoiceSerializer(invoice, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+    @action(detail=True, methods=["get", "post"])
+    def retainer(self, request, pk=None):
+        # GET  /api/projects/<id>/retainer/  every month so far + the next, with paid/unpaid status
+        # POST /api/projects/<id>/retainer/  {"period": "2026-11-05", "paid": true|false}
+        project = self.get_object()
+        if request.method == "POST":
+            try:
+                period = date.fromisoformat(str(request.data.get("period")))
+            except ValueError:
+                return Response({"detail": "Send the month as a date, e.g. 2026-11-05."}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                billing.set_retainer_paid(project, period, bool(request.data.get("paid", True)))
+            except ValueError as e:
+                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            project = self.get_queryset().get(pk=project.pk)  # fresh payments
+        return Response({
+            "project": self.get_serializer(project).data,
+            "months": billing.retainer_overview(project),
+        })
+
+
+class _ProjectChildViewSet(viewsets.ModelViewSet):
+    """Notes and to-dos: scoped to the user's projects, filterable with ?project=<id>."""
+    permission_classes = [permissions.IsAuthenticated]
+    model = None
+
+    def get_queryset(self):
+        qs = self.model.objects.filter(project__client__owner=self.request.user)
+        project_id = self.request.query_params.get("project")
+        if project_id:
+            qs = qs.filter(project_id=project_id)
+        return qs
+
+
+class ProjectNoteViewSet(_ProjectChildViewSet):
+    serializer_class = ProjectNoteSerializer
+    model = ProjectNote
+
+
+class ProjectTodoViewSet(_ProjectChildViewSet):
+    serializer_class = ProjectTodoSerializer
+    model = ProjectTodo
 
 
 class InvoiceViewSet(viewsets.ModelViewSet):
@@ -118,7 +166,20 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         # Paying the fixed-fee invoice marks the project as paid too.
         if new_status == "paid" and invoice.kind == "fixed" and invoice.project_id:
             Project.objects.filter(pk=invoice.project_id).update(payment_status="paid")
+        # Paying a monthly invoice pays that month of the retainer.
+        if new_status == "paid":
+            billing.record_invoice_paid(invoice)
+        # Voiding a monthly invoice frees its month to be invoiced again.
+        if new_status == "void" and invoice.kind == "monthly" and invoice.project:
+            billing.sync_next_invoice_date(invoice.project)
         return Response(self.get_serializer(invoice).data)
+
+    def perform_destroy(self, invoice):
+        # Deleting a monthly invoice frees its month to be invoiced again.
+        project = invoice.project if invoice.kind == "monthly" else None
+        invoice.delete()
+        if project:
+            billing.sync_next_invoice_date(project)
 
     @action(detail=True, methods=["post"])
     def mark_sent(self, request, pk=None):

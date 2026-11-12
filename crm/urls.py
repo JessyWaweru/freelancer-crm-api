@@ -6,7 +6,7 @@ from rest_framework.routers import DefaultRouter
 # retrieve, create, update, and delete.
 from .views import (
     ClientViewSet, ProjectViewSet, InvoiceViewSet, HealthCheckView,
-    BusinessProfileView, RemindersView, DashboardView,
+    BusinessProfileView, RemindersView, DashboardView, ProjectNoteViewSet, ProjectTodoViewSet,
 )
 from .register import RegisterView
 # ✅ API router
@@ -14,6 +14,8 @@ router = DefaultRouter()
 router.register(r"clients", ClientViewSet, basename="client")
 router.register(r"projects", ProjectViewSet, basename="project")
 router.register(r"invoices", InvoiceViewSet, basename="invoice")
+router.register(r"notes", ProjectNoteViewSet, basename="note")
+router.register(r"todos", ProjectTodoViewSet, basename="todo")
 
 urlpatterns = [
     # API endpoints
