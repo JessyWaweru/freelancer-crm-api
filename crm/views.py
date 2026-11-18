@@ -8,10 +8,14 @@ from rest_framework import status
 from rest_framework.decorators import action
 from datetime import date
 
-from .models import Client, Project, Invoice, ProjectNote, ProjectTodo
+from django.db.models import F
+from django.shortcuts import get_object_or_404
+from rest_framework.throttling import AnonRateThrottle
+
+from .models import Client, Project, Invoice, Payment, ProjectNote, ProjectTodo
 from .serializers import (
     ClientSerializer, ProjectSerializer, InvoiceSerializer, BusinessProfileSerializer,
-    ProjectNoteSerializer, ProjectTodoSerializer,
+    ProjectNoteSerializer, ProjectTodoSerializer, PaymentSerializer, PublicInvoiceSerializer,
 )
 from . import billing
 from django.contrib.auth import get_user_model
@@ -59,6 +63,21 @@ class ClientViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user)
         # Saves the client with the logged-in user as the owner.
+
+    @action(detail=True)
+    def summary(self, request, pk=None):
+        # GET /api/clients/<id>/summary/ : everything this client has paid, per currency.
+        client = self.get_object()
+        out = {}
+        for when, currency, amount, client_id, _ in billing.earnings_ledger(request.user):
+            if client_id != client.id:
+                continue
+            e = out.setdefault(currency, {"currency": currency, "paid": 0, "payments": 0, "first_paid": when, "last_paid": when})
+            e["paid"] += amount
+            e["payments"] += 1
+            e["first_paid"] = min(e["first_paid"], when)
+            e["last_paid"] = max(e["last_paid"], when)
+        return Response({"earned": sorted(out.values(), key=lambda e: e["paid"], reverse=True)})
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -149,7 +168,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         qs = (
             Invoice.objects.filter(owner=self.request.user)
             .select_related("client", "project")
-            .prefetch_related("items")
+            .prefetch_related("items", "payments")
         )
         for param in ("client", "project", "status"):
             value = self.request.query_params.get(param)
@@ -185,13 +204,78 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     def mark_sent(self, request, pk=None):
         return self._set_status(request, "sent", "sent_at")
 
+    def _fresh(self, invoice):
+        return Response(self.get_serializer(self.get_queryset().get(pk=invoice.pk)).data)
+
     @action(detail=True, methods=["post"])
     def mark_paid(self, request, pk=None):
+        # Paying in full records a payment for whatever is still owed, so earnings see it.
+        invoice = self.get_object()
+        if invoice.status != "void" and invoice.balance > 0:
+            billing.record_payment(invoice, invoice.balance, method=request.data.get("method") or "other")
+            return self._fresh(invoice)
         return self._set_status(request, "paid", "paid_at")
 
     @action(detail=True, methods=["post"])
     def void(self, request, pk=None):
         return self._set_status(request, "void", None)
+
+    @action(detail=True, methods=["post"])
+    def payments(self, request, pk=None):
+        # POST /api/invoices/<id>/payments/  {"amount", "paid_on"?, "method"?, "reference"?}
+        invoice = self.get_object()
+        s = PaymentSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        try:
+            billing.record_payment(invoice, **s.validated_data)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return self._fresh(invoice)
+
+    @action(detail=True, methods=["delete"], url_path=r"payments/(?P<payment_id>\d+)")
+    def delete_payment(self, request, pk=None, payment_id=None):
+        invoice = self.get_object()
+        billing.delete_payment(get_object_or_404(Payment, pk=payment_id, invoice=invoice))
+        return self._fresh(invoice)
+
+    @action(detail=True, methods=["post"])
+    def share(self, request, pk=None):
+        # Makes (once) the secret for the client's view-only link.
+        invoice = self.get_object()
+        billing.ensure_public_token(invoice)
+        return self._fresh(invoice)
+
+    @action(detail=True, methods=["post"])
+    def duplicate(self, request, pk=None):
+        copy = billing.duplicate_invoice(self.get_object())
+        return Response(
+            self.get_serializer(self.get_queryset().get(pk=copy.pk)).data, status=status.HTTP_201_CREATED
+        )
+
+
+class PublicInvoiceThrottle(AnonRateThrottle):
+    rate = "120/hour"
+
+
+class PublicInvoiceView(APIView):
+    """GET /api/public/invoices/<token>/ : the client's view of a shared invoice, no login.
+
+    Counts a view unless ?preview=1 (the freelancer looking at their own link).
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [PublicInvoiceThrottle]
+
+    def get(self, request, token):
+        qs = Invoice.objects.select_related("client", "project", "owner").prefetch_related("items", "payments")
+        invoice = get_object_or_404(qs, public_token=token)
+        if request.query_params.get("preview") != "1":
+            now = timezone.now()
+            Invoice.objects.filter(pk=invoice.pk).update(
+                view_count=F("view_count") + 1, last_viewed_at=now,
+            )
+            Invoice.objects.filter(pk=invoice.pk, first_viewed_at=None).update(first_viewed_at=now)
+        return Response(PublicInvoiceSerializer(invoice).data)
 
 
 class BusinessProfileView(APIView):

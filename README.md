@@ -44,7 +44,10 @@ Every one of these is covered by tests.
 - 🧾 **Invoices** with line items and per-user numbering (`INV-0001`…), moving draft → sent → paid (or void). Paying a fixed-fee invoice marks its project paid
 - ⚡ **One-click generation** from a project: the fixed fee, or the next month's retainer (which moves the next invoice date forward a month)
 - 🔔 **Reminders feed**: retainers coming due, project fees not yet invoiced, drafts not sent, and sent invoices past their due date, most urgent first
-- 📊 **Dashboard totals** per currency (never mixed): outstanding, overdue, paid this month, monthly retainer income
+- 💳 **Part payments**: record M-Pesa, bank, cash, card or PayPal payments with a reference; the invoice is paid once they cover it, and earnings count each payment on the day it arrived
+- 🧮 **Tax and discounts** per invoice (e.g. 16% VAT), with a default rate in the business profile
+- 🔗 **Client links**: a secret view-only link per invoice (`/api/public/invoices/<token>/`), with view counts so you know when the client opened it
+- 📊 **Dashboard totals** per currency (never mixed): outstanding, overdue, paid this month, monthly retainer income, plus a 30-day cash forecast
 
 ## 📡 API
 
@@ -56,9 +59,13 @@ Every one of these is covered by tests.
 | `GET` `POST` `PATCH` `DELETE` | `/api/projects/…?client=<id>` | Your projects | 🔐 |
 | `POST` | `/api/projects/<id>/generate_invoice/` | Draft an invoice: `{"kind": "fixed" \| "monthly"}` | 🔐 |
 | `GET` `POST` `PATCH` `DELETE` | `/api/invoices/…?client=&project=&status=` | Your invoices, with nested `items` | 🔐 |
-| `POST` | `/api/invoices/<id>/mark_sent/` · `mark_paid/` · `void/` | Move an invoice along | 🔐 |
+| `POST` | `/api/invoices/<id>/mark_sent/` · `mark_paid/` · `void/` | Move an invoice along (`mark_paid` records a payment for the balance) | 🔐 |
+| `POST` `DELETE` | `/api/invoices/<id>/payments/` · `payments/<pid>/` | Record or remove a payment: `{"amount", "paid_on"?, "method"?, "reference"?}` | 🔐 |
+| `POST` | `/api/invoices/<id>/share/` · `duplicate/` | Make the client link · copy as a new draft | 🔐 |
+| `GET` | `/api/public/invoices/<token>/` | The client's view of a shared invoice (counts a view unless `?preview=1`) | 🌍 |
+| `GET` | `/api/clients/<id>/summary/` | What a client has paid, per currency | 🔐 |
 | `GET` | `/api/reminders/` | What needs invoicing or chasing | 🔐 |
-| `GET` | `/api/dashboard/` | Money totals per currency | 🔐 |
+| `GET` | `/api/dashboard/` | Money totals, earnings and 30-day forecast per currency | 🔐 |
 | `GET` `PUT` | `/api/profile/` | Business details on invoices, numbering, terms, reminder lead time | 🔐 |
 | `GET` | `/api/health/` | Uptime ping | 🌍 |
 

@@ -3,14 +3,15 @@
 Kept out of views.py so the rules are easy to read and test on their own.
 """
 import calendar
-from datetime import date, timedelta
+import secrets
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
-from .models import BusinessProfile, Invoice, InvoiceItem, Project, ProjectTodo, RetainerPayment
+from .models import BusinessProfile, Invoice, InvoiceItem, Payment, Project, ProjectTodo, RetainerPayment
 
 # Safety cap on how many months a retainer schedule is walked (50 years).
 MAX_PERIODS = 600
@@ -126,22 +127,31 @@ def sync_next_invoice_date(project):
 
 @transaction.atomic
 def set_retainer_paid(project, period, paid=True):
-    """Mark one month of a retainer paid (or undo it). Also settles that month's invoice."""
+    """Mark one month of a retainer paid (or undo it). Also settles (or reopens) that month's invoice."""
     today = timezone.localdate()
     if period not in retainer_schedule(project, today + timedelta(days=366)):
         raise ValueError("That date isn't one of this retainer's payment dates.")
     invoice = _open_monthly_invoices(project).filter(period_start=period).first()
     if paid:
+        if invoice and invoice.status != "paid":
+            if invoice.balance > 0:
+                # A payment for what's left; it pays the month through record_invoice_paid.
+                invoice = record_payment(invoice, invoice.balance, method="other")
+            else:
+                invoice.status = "paid"
+                invoice.paid_at = invoice.paid_at or timezone.now()
+                invoice.save(update_fields=["status", "paid_at"])
         RetainerPayment.objects.get_or_create(
             project=project, period_start=period,
             defaults={"amount": invoice.total if invoice else project.monthly_amount, "invoice": invoice},
         )
-        if invoice and invoice.status != "paid":
-            invoice.status = "paid"
-            invoice.paid_at = invoice.paid_at or timezone.now()
-            invoice.save(update_fields=["status", "paid_at"])
     else:
         RetainerPayment.objects.filter(project=project, period_start=period).delete()
+        if invoice and invoice.status == "paid":
+            # Undoing the month undoes the payment on its invoice too, so earnings stay right.
+            invoice.payments.all().delete()
+            invoice.status, invoice.paid_at = "sent", None
+            invoice.save(update_fields=["status", "paid_at"])
     sync_next_invoice_date(project)
 
 
@@ -152,9 +162,108 @@ def record_invoice_paid(invoice):
         return
     RetainerPayment.objects.get_or_create(
         project=project, period_start=invoice.period_start,
-        defaults={"amount": invoice.total, "invoice": invoice},
+        defaults={
+            "amount": invoice.total, "invoice": invoice,
+            "paid_on": timezone.localdate(invoice.paid_at) if invoice.paid_at else timezone.localdate(),
+        },
     )
     sync_next_invoice_date(project)
+
+
+# ── Payments ────────────────────────────────────────────────
+# An invoice is paid when its payments add up to its total. Every change of payments goes
+# through sync_invoice_status so the invoice, the project's fee status and the retainer month agree.
+
+def _as_datetime(d):
+    """A payment date as a timestamp: now for today, midday otherwise."""
+    if d == timezone.localdate():
+        return timezone.now()
+    return timezone.make_aware(datetime.combine(d, time(12)))
+
+
+def sync_invoice_status(invoice):
+    """Mark the invoice paid once covered, or back to sent if a payment was removed."""
+    invoice = Invoice.objects.select_related("project").prefetch_related("items", "payments").get(pk=invoice.pk)
+    if invoice.status == "void":
+        return invoice
+    paid, total, project = invoice.amount_paid, invoice.total, invoice.project
+    if paid > 0 and paid >= total:
+        if invoice.status != "paid":
+            last = list(invoice.payments.all())[-1].paid_on
+            invoice.status = "paid"
+            invoice.paid_at = _as_datetime(last)
+            invoice.sent_at = invoice.sent_at or invoice.paid_at
+            invoice.save(update_fields=["status", "paid_at", "sent_at"])
+        if project and invoice.kind == "fixed":
+            Project.objects.filter(pk=project.pk).update(payment_status="paid")
+        record_invoice_paid(invoice)
+    else:
+        if invoice.status == "paid":
+            invoice.status, invoice.paid_at = "sent", None
+            invoice.save(update_fields=["status", "paid_at"])
+            if invoice.kind == "monthly" and project:
+                RetainerPayment.objects.filter(project=project, invoice=invoice).delete()
+                sync_next_invoice_date(project)
+        if project and invoice.kind == "fixed":
+            Project.objects.filter(pk=project.pk).update(payment_status="partial" if paid > 0 else "unpaid")
+    return invoice
+
+
+@transaction.atomic
+def record_payment(invoice, amount, paid_on=None, method="mpesa", reference=""):
+    """Record money received against an invoice. Raises ValueError for amounts it can't take."""
+    invoice = Invoice.objects.prefetch_related("items", "payments").get(pk=invoice.pk)
+    amount = Decimal(str(amount)).quantize(Decimal("0.01"))
+    if invoice.status == "void":
+        raise ValueError("This invoice is void.")
+    if amount <= 0:
+        raise ValueError("Enter an amount above zero.")
+    balance = invoice.balance
+    if balance <= 0:
+        raise ValueError("This invoice is already paid in full.")
+    if amount > balance:
+        raise ValueError(f"That's more than the {invoice.currency} {balance:,.2f} still owed.")
+    if invoice.status == "draft":
+        # Getting paid means the client has it.
+        invoice.status, invoice.sent_at = "sent", invoice.sent_at or timezone.now()
+        invoice.save(update_fields=["status", "sent_at"])
+    Payment.objects.create(
+        invoice=invoice, amount=amount, paid_on=paid_on or timezone.localdate(),
+        method=method or "other", reference=reference or "",
+    )
+    return sync_invoice_status(invoice)
+
+
+@transaction.atomic
+def delete_payment(payment):
+    invoice = payment.invoice
+    payment.delete()
+    return sync_invoice_status(invoice)
+
+
+def ensure_public_token(invoice):
+    if not invoice.public_token:
+        invoice.public_token = secrets.token_urlsafe(18)
+        invoice.save(update_fields=["public_token"])
+    return invoice.public_token
+
+
+@transaction.atomic
+def duplicate_invoice(invoice):
+    """A fresh draft with the same client, lines, tax and notes, dated today."""
+    profile = get_profile(invoice.owner)
+    today = timezone.localdate()
+    copy = Invoice.objects.create(
+        owner=invoice.owner, client=invoice.client, project=invoice.project, kind="custom",
+        currency=invoice.currency, issue_date=today, due_date=today + timedelta(days=profile.payment_terms_days),
+        notes=invoice.notes, discount=invoice.discount, tax_rate=invoice.tax_rate, tax_label=invoice.tax_label,
+        number=next_invoice_number(invoice.owner),
+    )
+    InvoiceItem.objects.bulk_create([
+        InvoiceItem(invoice=copy, description=i.description, quantity=i.quantity, unit_price=i.unit_price)
+        for i in invoice.items.all()
+    ])
+    return copy
 
 
 def retainer_overview(project):
@@ -198,6 +307,8 @@ def generate_invoice(project: Project, kind: str) -> Invoice:
         currency=project.payment_currency,
         issue_date=today,
         due_date=today + timedelta(days=profile.payment_terms_days),
+        tax_rate=profile.default_tax_rate,
+        tax_label=profile.tax_label,
     )
 
     if kind == "monthly":
@@ -367,7 +478,11 @@ def build_reminders(user):
             "action": "open_project",
         })
 
-    invoices = Invoice.objects.select_related("client").prefetch_related("items").filter(owner=user)
+    invoices = Invoice.objects.select_related("client").prefetch_related("items", "payments").filter(owner=user)
+
+    def owed_detail(inv, text):
+        paid = inv.amount_paid
+        return f"{text} · {inv.currency} {paid:,.0f} paid so far" if paid > 0 else text
 
     # 3. Drafts waiting to go out.
     for inv in invoices.filter(status="draft"):
@@ -394,8 +509,8 @@ def build_reminders(user):
             "severity": "overdue",
             "date": inv.due_date,
             "title": f"{inv.client.name} hasn't paid {inv.number}",
-            "detail": f"{days} day{'s' if days != 1 else ''} overdue",
-            "amount": inv.total,
+            "detail": owed_detail(inv, f"{days} day{'s' if days != 1 else ''} overdue"),
+            "amount": inv.balance,
             "currency": inv.currency,
             "project": inv.project_id,
             "invoice": inv.id,
@@ -410,8 +525,8 @@ def build_reminders(user):
             "severity": severity(inv.due_date),
             "date": inv.due_date,
             "title": f"{inv.number} from {inv.client.name} is due",
-            "detail": "Waiting for payment",
-            "amount": inv.total,
+            "detail": owed_detail(inv, "Waiting for payment"),
+            "amount": inv.balance,
             "currency": inv.currency,
             "project": inv.project_id,
             "invoice": inv.id,
@@ -426,20 +541,21 @@ def build_reminders(user):
 def earnings_ledger(user):
     """Every payment received, as (date, currency, amount, client_id, client_name).
 
-    Counted once each: paid invoices; retainer months marked paid without a paid invoice;
-    fixed fees marked paid on the project without a paid invoice for them.
+    Counted once each: payments on invoices (on the day they came in, so part payments land in
+    the right month); retainer months marked paid without a paid invoice; fixed fees marked paid
+    on the project without any payment on an invoice for them.
     """
     rows = []
     paid_fee_projects = set()
-    paid_invoices = Invoice.objects.filter(owner=user, status="paid").select_related("client").prefetch_related("items")
-    for inv in paid_invoices:
-        when = timezone.localdate(inv.paid_at) if inv.paid_at else inv.issue_date
-        rows.append((when, inv.currency, inv.total, inv.client_id, inv.client.name))
+    payments = Payment.objects.filter(invoice__owner=user).select_related("invoice__client")
+    for pay in payments:
+        inv = pay.invoice
+        rows.append((pay.paid_on, inv.currency, pay.amount, inv.client_id, inv.client.name))
         if inv.kind != "monthly" and inv.project_id:
             paid_fee_projects.add(inv.project_id)
 
-    payments = RetainerPayment.objects.filter(project__client__owner=user).select_related("project__client", "invoice")
-    for rp in payments:
+    retainer_payments = RetainerPayment.objects.filter(project__client__owner=user).select_related("project__client", "invoice")
+    for rp in retainer_payments:
         if rp.invoice and rp.invoice.status == "paid":
             continue  # already counted with its invoice
         c = rp.project.client
@@ -491,9 +607,12 @@ def earnings_summary(user, months=12):
 def dashboard_totals(user):
     """Money totals per currency (never mixed across currencies)."""
     today = timezone.localdate()
-    month_start = today.replace(day=1)
     totals = {}
-    for inv in Invoice.objects.prefetch_related("items").filter(owner=user).exclude(status="void"):
+    invoices = list(
+        Invoice.objects.select_related("client").prefetch_related("items", "payments")
+        .filter(owner=user).exclude(status="void")
+    )
+    for inv in invoices:
         t = totals.setdefault(inv.currency, {
             "currency": inv.currency,
             "outstanding": Decimal("0.00"),
@@ -501,15 +620,13 @@ def dashboard_totals(user):
             "paid_this_month": Decimal("0.00"),
             "draft": Decimal("0.00"),
         })
-        total = inv.total
         if inv.status == "sent":
-            t["outstanding"] += total
+            balance = inv.balance
+            t["outstanding"] += balance
             if inv.due_date < today:
-                t["overdue"] += total
+                t["overdue"] += balance
         elif inv.status == "draft":
-            t["draft"] += total
-        elif inv.status == "paid" and inv.paid_at and timezone.localdate(inv.paid_at) >= month_start:
-            t["paid_this_month"] += total
+            t["draft"] += inv.total
 
     # Monthly recurring revenue from active retainers.
     mrr = {}
@@ -528,4 +645,53 @@ def dashboard_totals(user):
         "earnings": earnings,
         "totals": list(totals.values()),
         "mrr": [{"currency": c, "amount": a} for c, a in mrr.items() if a > 0],
+        "forecast": cash_forecast(user, invoices),
     }
+
+
+FORECAST_DAYS = 30
+
+
+def cash_forecast(user, invoices=None):
+    """Money expected in the next 30 days per currency, and what's already late.
+
+    Counts sent invoices (their balance) and retainer months that aren't invoiced yet.
+    """
+    today = timezone.localdate()
+    horizon = today + timedelta(days=FORECAST_DAYS)
+    if invoices is None:
+        invoices = Invoice.objects.select_related("client").prefetch_related("items", "payments").filter(owner=user)
+    out = {}
+
+    def add(currency, when, amount, label, detail, link):
+        f = out.setdefault(currency, {
+            "currency": currency, "late": Decimal("0.00"), "next_30_days": Decimal("0.00"), "items": [],
+        })
+        f["late" if when < today else "next_30_days"] += amount
+        f["items"].append({"date": when, "amount": amount, "label": label, "detail": detail, "link": link})
+
+    invoiced_months = set()
+    for inv in invoices:
+        if inv.kind == "monthly" and inv.status != "void":
+            invoiced_months.add((inv.project_id, inv.period_start))
+        if inv.status != "sent" or inv.due_date > horizon:
+            continue
+        balance = inv.balance
+        if balance > 0:
+            add(inv.currency, inv.due_date, balance, inv.client.name, inv.number, f"/app/invoices/{inv.id}")
+
+    recurring = (
+        Project.objects.select_related("client").prefetch_related("retainer_payments")
+        .filter(client__owner=user, status="active", billing_type__in=["monthly", "both"], monthly_amount__gt=0)
+        .exclude(retainer_start=None)
+    )
+    for p in recurring:
+        paid = paid_periods(p)
+        for d in retainer_schedule(p, horizon):
+            if d in paid or (p.id, d) in invoiced_months:
+                continue
+            add(p.payment_currency, d, p.monthly_amount, p.client.name, f"{d:%B} retainer · {p.title}", f"/app/projects/{p.id}")
+
+    for f in out.values():
+        f["items"].sort(key=lambda i: i["date"])
+    return list(out.values())

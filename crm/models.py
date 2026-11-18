@@ -154,6 +154,9 @@ class BusinessProfile(models.Model):
     payment_terms_days = models.PositiveSmallIntegerField(default=14)
     # How many days before an invoice is due to be sent the reminder appears.
     reminder_days_before = models.PositiveSmallIntegerField(default=3)
+    # Tax added to new invoices, e.g. 16 (%) labelled "VAT". 0 means no tax line.
+    default_tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
+    tax_label = models.CharField(max_length=20, default="VAT")
 
 
 INVOICE_STATUS_CHOICES = [
@@ -186,9 +189,19 @@ class Invoice(models.Model):
     period_start = models.DateField(null=True, blank=True)
     period_end = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True, default="")
+    # Taken off the subtotal before tax.
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    # Percent added on top of (subtotal - discount), e.g. 16 for VAT.
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
+    tax_label = models.CharField(max_length=20, default="VAT")
     sent_at = models.DateTimeField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Secret for the client's view-only link (/i/<token>). Made the first time the link is shared.
+    public_token = models.CharField(max_length=40, unique=True, null=True, blank=True)
+    view_count = models.PositiveIntegerField(default=0)
+    first_viewed_at = models.DateTimeField(null=True, blank=True)
+    last_viewed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-issue_date", "-id"]
@@ -197,8 +210,28 @@ class Invoice(models.Model):
         ]
 
     @property
-    def total(self):
+    def subtotal(self):
         return sum((item.amount for item in self.items.all()), Decimal("0.00"))
+
+    @property
+    def tax_amount(self):
+        base = max(self.subtotal - self.discount, Decimal("0.00"))
+        return (base * self.tax_rate / Decimal("100")).quantize(Decimal("0.01"))
+
+    @property
+    def total(self):
+        return max(self.subtotal - self.discount, Decimal("0.00")) + self.tax_amount
+
+    @property
+    def amount_paid(self):
+        # .all() so a prefetch_related("payments") is reused.
+        return sum((p.amount for p in self.payments.all()), Decimal("0.00"))
+
+    @property
+    def balance(self):
+        if self.status == "void":
+            return Decimal("0.00")
+        return max(self.total - self.amount_paid, Decimal("0.00"))
 
     @property
     def is_overdue(self):
@@ -220,4 +253,28 @@ class InvoiceItem(models.Model):
     @property
     def amount(self):
         return (self.quantity * self.unit_price).quantize(Decimal("0.01"))
+
+
+PAYMENT_METHOD_CHOICES = [
+    ("mpesa", "M-Pesa"),
+    ("bank", "Bank transfer"),
+    ("cash", "Cash"),
+    ("card", "Card"),
+    ("paypal", "PayPal"),
+    ("other", "Other"),
+]
+
+
+class Payment(models.Model):
+    """Money received against an invoice. An invoice is paid once its payments cover the total."""
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="payments")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    paid_on = models.DateField(default=timezone.localdate)
+    method = models.CharField(max_length=10, choices=PAYMENT_METHOD_CHOICES, default="mpesa")
+    # e.g. the M-Pesa confirmation code or bank reference.
+    reference = models.CharField(max_length=100, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["paid_on", "id"]
 

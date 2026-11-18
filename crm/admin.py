@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Client, Project, BusinessProfile, Invoice, InvoiceItem
+from .models import Client, Project, BusinessProfile, Invoice, InvoiceItem, Payment
 
 admin.site.register(Client)
 admin.site.register(Project)
@@ -11,8 +11,13 @@ class InvoiceItemInline(admin.TabularInline):
     extra = 0
 
 
+class PaymentInline(admin.TabularInline):
+    model = Payment
+    extra = 0
+
+
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ("number", "client", "status", "issue_date", "due_date")
+    list_display = ("number", "client", "status", "issue_date", "due_date", "view_count")
     list_filter = ("status", "kind")
-    inlines = [InvoiceItemInline]
+    inlines = [InvoiceItemInline, PaymentInline]

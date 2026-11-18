@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
 from .models import (
-    Client, Project, ProjectItem, ProjectNote, ProjectTodo, BusinessProfile, Invoice, InvoiceItem,
+    Client, Project, ProjectItem, ProjectNote, ProjectTodo, BusinessProfile, Invoice, InvoiceItem, Payment,
 )
 from . import billing
 from .billing import first_billing_date, next_invoice_number
@@ -172,9 +172,25 @@ class InvoiceItemSerializer(serializers.ModelSerializer):
         fields = ("id", "description", "quantity", "unit_price", "amount")
 
 
+class PaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Payment
+        fields = ("id", "amount", "paid_on", "method", "reference", "created_at")
+        read_only_fields = ("id", "created_at")
+
+
+def _money_field():
+    return serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+
 class InvoiceSerializer(serializers.ModelSerializer):
     items = InvoiceItemSerializer(many=True)
-    total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    payments = PaymentSerializer(many=True, read_only=True)
+    subtotal = _money_field()
+    tax_amount = _money_field()
+    total = _money_field()
+    amount_paid = _money_field()
+    balance = _money_field()
     is_overdue = serializers.BooleanField(read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True)
     client_company = serializers.CharField(source="client.company", read_only=True)
@@ -185,7 +201,20 @@ class InvoiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
         fields = "__all__"
-        read_only_fields = ("owner", "number", "sent_at", "paid_at", "created_at")
+        read_only_fields = (
+            "owner", "number", "sent_at", "paid_at", "created_at",
+            "public_token", "view_count", "first_viewed_at", "last_viewed_at",
+        )
+
+    def validate_discount(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Discount can't be negative.")
+        return value
+
+    def validate_tax_rate(self, value):
+        if not 0 <= value <= 100:
+            raise serializers.ValidationError("Tax must be between 0 and 100%.")
+        return value
 
     def validate_client(self, client):
         if client.owner_id != self.context["request"].user.id:
@@ -209,6 +238,9 @@ class InvoiceSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         items = validated_data.pop("items")
         user = self.context["request"].user
+        profile = billing.get_profile(user)
+        validated_data.setdefault("tax_rate", profile.default_tax_rate)
+        validated_data.setdefault("tax_label", profile.tax_label)
         invoice = Invoice.objects.create(owner=user, number=next_invoice_number(user), **validated_data)
         InvoiceItem.objects.bulk_create(
             [InvoiceItem(invoice=invoice, **{k: v for k, v in i.items() if k != "id"}) for i in items]
@@ -225,6 +257,46 @@ class InvoiceSerializer(serializers.ModelSerializer):
             InvoiceItem.objects.bulk_create(
                 [InvoiceItem(invoice=invoice, **{k: v for k, v in i.items() if k != "id"}) for i in items]
             )
+        # A new total can settle (or reopen) the invoice against payments already made.
+        if invoice.payments.exists():
+            billing.sync_invoice_status(invoice)
+            invoice.refresh_from_db()
         return invoice
+
+
+class PublicInvoiceSerializer(serializers.ModelSerializer):
+    """What the client sees on the shared link: no ids, owner or tracking fields."""
+    items = serializers.SerializerMethodField()
+    subtotal = _money_field()
+    tax_amount = _money_field()
+    total = _money_field()
+    amount_paid = _money_field()
+    balance = _money_field()
+    is_overdue = serializers.BooleanField(read_only=True)
+    client_name = serializers.CharField(source="client.name", read_only=True)
+    client_company = serializers.CharField(source="client.company", read_only=True)
+    project_title = serializers.CharField(source="project.title", read_only=True, default=None)
+    business = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Invoice
+        fields = (
+            "number", "status", "is_overdue", "currency", "issue_date", "due_date", "period_start", "period_end",
+            "items", "subtotal", "discount", "tax_rate", "tax_label", "tax_amount", "total", "amount_paid", "balance",
+            "notes", "client_name", "client_company", "project_title", "business",
+        )
+
+    def get_items(self, obj):
+        return [
+            {"description": i.description, "quantity": i.quantity, "unit_price": i.unit_price, "amount": i.amount}
+            for i in obj.items.all()
+        ]
+
+    def get_business(self, obj):
+        p = billing.get_profile(obj.owner)
+        return {
+            "business_name": p.business_name, "email": p.email, "phone": p.phone,
+            "address": p.address, "payment_details": p.payment_details,
+        }
 
 

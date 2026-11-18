@@ -7,6 +7,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ClientViewSet, ProjectViewSet, InvoiceViewSet, HealthCheckView,
     BusinessProfileView, RemindersView, DashboardView, ProjectNoteViewSet, ProjectTodoViewSet,
+    PublicInvoiceView,
 )
 from .register import RegisterView
 # ✅ API router
@@ -24,6 +25,7 @@ urlpatterns = [
     path("profile/", BusinessProfileView.as_view(), name="profile"),
     path("reminders/", RemindersView.as_view(), name="reminders"),
     path("dashboard/", DashboardView.as_view(), name="dashboard"),
+    path("public/invoices/<str:token>/", PublicInvoiceView.as_view(), name="public-invoice"),
 
     # Health check endpoint for uptime ping
    path("health/", HealthCheckView.as_view()),
